@@ -1,0 +1,7 @@
+torch
+segment-anything
+transformers
+torchvision
+numpy
+scipy
+Pillow 
