@@ -172,100 +172,56 @@ class YOLODetectionLoss(nn.Module):
         preds: detection head output (will be reshaped to grid format)
         targets: dict with 'batch_idx', 'cls', 'bboxes' keys
         """
-        print(f"[YOLO Loss] preds type: {type(preds)}")
-        
         # Handle detection head output format
         if isinstance(preds, (list, tuple)):
-            # Extract the detection results from the tuple
             detection_results = preds[0]  # This should be the actual predictions
-            print(f"[YOLO Loss] detection_results shape: {detection_results.shape}")
         else:
             detection_results = preds
-            print(f"[YOLO Loss] preds shape: {preds.shape}")
-        
-        # Debug targets
-        print(f"[YOLO Loss] targets type: {type(targets)}")
-        if isinstance(targets, dict):
-            print(f"[YOLO Loss] targets keys: {list(targets.keys())}")
-            for key, value in targets.items():
-                if hasattr(value, 'shape'):
-                    print(f"[YOLO Loss] targets['{key}'] shape: {value.shape}")
-                else:
-                    print(f"[YOLO Loss] targets['{key}'] type: {type(value)}")
-        else:
-            print(f"[YOLO Loss] targets is not a dict: {targets}")
-        
         # Check if we have valid targets
         if not (isinstance(targets, dict) and 'batch_idx' in targets and 'cls' in targets and 'bboxes' in targets):
-            print("[YOLO Loss] Missing required target keys, returning dummy loss")
-            print(f"[YOLO Loss] Available keys: {list(targets.keys()) if isinstance(targets, dict) else 'not a dict'}")
             return torch.tensor(0.0, device=self.device, requires_grad=True)
-        
         batch_size = detection_results.shape[0] if len(detection_results.shape) > 2 else 1
-        
-        # convert predictions to grid format
-        # assuming detection_results is [batch, num_detections, 6] (x1, y1, x2, y2, conf, class)
-        # need to convert this to [batch, 5, grid_size, grid_size] format
+        # Convert predictions to grid format
         if len(detection_results.shape) == 3:
-            # Reshape to grid format
             pred_grid = torch.zeros(batch_size, 5, self.grid_size, self.grid_size, device=self.device)
-            
-            # For now, use a simplified approach - take the first detection and place it in the center
-            # In practice, you'd want to properly map detections to grid cells
             for b in range(batch_size):
                 if detection_results[b].shape[0] > 0:
-                    # Take the first detection
                     det = detection_results[b][0]
                     if len(det) >= 4:
                         x1, y1, x2, y2 = det[:4]
-                        # Convert to center coordinates and normalize
                         xc = (x1 + x2) / 2.0
                         yc = (y1 + y2) / 2.0
                         w = x2 - x1
                         h = y2 - y1
-                        
-                        # Place in center of grid
                         center_i = self.grid_size // 2
                         center_j = self.grid_size // 2
-                        pred_grid[b, 0, center_j, center_i] = 1.0  # objectness
+                        pred_grid[b, 0, center_j, center_i] = 1.0
                         pred_grid[b, 1, center_j, center_i] = xc
                         pred_grid[b, 2, center_j, center_i] = yc
                         pred_grid[b, 3, center_j, center_i] = w
                         pred_grid[b, 4, center_j, center_i] = h
         else:
-            # If not the expected format, return dummy loss
-            print(f"[YOLO Loss] Unexpected prediction format: {detection_results.shape}")
             return torch.tensor(0.0, device=self.device, requires_grad=True)
-        
         # Build targets in grid format
         target_grid = torch.zeros(batch_size, 5, self.grid_size, self.grid_size, device=self.device)
-        
         for i, (batch_idx, cls, bbox) in enumerate(zip(targets['batch_idx'], targets['cls'], targets['bboxes'])):
             batch_idx = batch_idx.item()
             if batch_idx < batch_size:
-                # Convert bbox from [x1, y1, x2, y2] to [class, xc, yc, w, h] format
                 x1, y1, x2, y2 = bbox
                 xc = (x1 + x2) / 2.0
                 yc = (y1 + y2) / 2.0
                 w = x2 - x1
                 h = y2 - y1
-                
-                # Convert to grid coordinates
                 grid_i = int(xc * self.grid_size)
                 grid_j = int(yc * self.grid_size)
                 grid_i = min(max(grid_i, 0), self.grid_size - 1)
                 grid_j = min(max(grid_j, 0), self.grid_size - 1)
-                
-                target_grid[batch_idx, 0, grid_j, grid_i] = 1.0  # objectness
+                target_grid[batch_idx, 0, grid_j, grid_i] = 1.0
                 target_grid[batch_idx, 1, grid_j, grid_i] = xc
                 target_grid[batch_idx, 2, grid_j, grid_i] = yc
                 target_grid[batch_idx, 3, grid_j, grid_i] = w
                 target_grid[batch_idx, 4, grid_j, grid_i] = h
-        
-        # Compute loss
         loss = self.detection_loss_fn(pred_grid, target_grid)
-        print(f"[YOLO Loss] Detection loss: {loss.item()}")
-        
         return loss
 
 # Usage:
