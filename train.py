@@ -97,7 +97,7 @@ cls_ds = SUTCrackDataset(root_dir, task='classification')
 # Instantiate the multitask DataLoader
 loader = MultiTaskDataLoader(seg_ds, det_ds, cls_ds, batch_size=3)
 
-num_epochs = 10
+num_epochs = 200
 
 # Clear GPU memory at start of training
 torch.cuda.empty_cache()
@@ -115,7 +115,6 @@ for epoch in range(num_epochs):
         task_id = task_ids[0]
         targets = {}
         if task_id == 'segmentation':
-            # Filter out samples without masks for segmentation
             valid_samples = [sample for sample in batch if sample['mask'] is not None]
             if len(valid_samples) == 0:
                 print("No valid samples in segmentation batch, skipping...")
@@ -129,7 +128,6 @@ for epoch in range(num_epochs):
                 masks_tensor = masks_tensor.float() / 255.0
             targets['mask'] = masks_tensor
         elif task_id == 'detection':
-            # Format detection targets for YOLO loss
             batch_idx = []
             cls = []
             bboxes = []
@@ -146,7 +144,7 @@ for epoch in range(num_epochs):
                         bbox[1] /= img_h  # y1
                         bbox[3] /= img_h  # y2
                         batch_idx.append(i)
-                        cls.append(sample['class'])  # Use the class label
+                        cls.append(sample['class'])  
                         bboxes.append(bbox)
             
             if len(batch_idx) == 0:
@@ -157,18 +155,13 @@ for epoch in range(num_epochs):
             targets['cls'] = torch.tensor(cls, device=device)
             targets['bboxes'] = torch.tensor(bboxes, device=device, dtype=torch.float32)
             
-            # Debug prints
-            print(f"[DEBUG] Detection targets created:")
-            print(f"[DEBUG] batch_idx: {targets['batch_idx'].shape}, {targets['batch_idx']}")
-            print(f"[DEBUG] cls: {targets['cls'].shape}, {targets['cls']}")
-            print(f"[DEBUG] bboxes: {targets['bboxes'].shape}, {targets['bboxes']}")
+
         elif task_id == 'classification':
             targets['class'] = torch.tensor([sample['class'] for sample in batch]).to(device)
         else:
             raise ValueError(f"Unknown task_id: {task_id}")
 
         outputs = model(images, task_id)
-        # outputs is now a dict with only the current task's output
         loss, loss_dict = multitask_loss(outputs, targets, task_id)
 
         # Checking for problematic loss values
@@ -186,7 +179,6 @@ for epoch in range(num_epochs):
 
         print(f"Epoch {epoch} | Task {task_id} | Loss: {loss.item():.4f} | Details: {loss_dict}")
 
-    # future: validation, checkpointing, etc.
 
 print("Training complete.")
 
@@ -217,7 +209,3 @@ torch.save({
 
 print(f"Model saved to: {model_path}")
 
-# Also save just the model for easier loading
-model_only_path = f'models/multitask_crack_model_{timestamp}_model_only.pth'
-torch.save(model.state_dict(), model_only_path)
-print(f"Model state dict saved to: {model_only_path}")

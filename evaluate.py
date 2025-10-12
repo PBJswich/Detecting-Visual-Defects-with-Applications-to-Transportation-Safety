@@ -13,15 +13,16 @@ from PIL import Image
 import torchvision.transforms as transforms
 import cv2
 
-# Import your model components
 from model_components.sam_encoder import SAMEncoder
 from model_components.adapters import SegmentationAdapter, DetectionAdapter, ClassificationAdapter
-from model_components.expert_modules import SegDetExpert, DetClsExpert, ClsSegExpert
-from model_components.dual_task_heads import SegDetHead, DetClsHead, ClsSegHead, SimpleSegmentationHead, SimpleDetectionHead
+from model_components.expert_modules import SegDetExpert, DetClsExpert, ClsSegExpert, BigExpert
+from model_components.dual_task_heads import UNetSegmentationHead, YOLOFeatureAdapter
 from model_components.multitask_model import MultiTaskModel
 from model_components.multitask_loss import MultiTaskLoss
 from model_components.SUTCrackDataset import SUTCrackDataset
 from model_components.multi_task_dataloader import MultiTaskDataLoader
+from ultralytics import YOLO
+from torchvision.models import resnet50, ResNet50_Weights
 
 class ModelEvaluator:
     def __init__(self, model_path, device='cuda'):
@@ -46,18 +47,42 @@ class ModelEvaluator:
         detcls_expert = DetClsExpert(input_dim1=256, input_dim2=256, output_dim=256)
         clsseg_expert = ClsSegExpert(input_dim1=256, input_dim2=256, output_dim=256)
         
-        # Create segmentation head
-        segmentation_head = SimpleSegmentationHead(in_channels=256, out_channels=1)
+        # big expert module
+        big_expert = BigExpert(input_dim1=256, input_dim2=256, input_dim3=256, output_dim=256)
         
-        # Create detection head
-        detection_head = SimpleDetectionHead(in_channels=256, num_classes=1, num_anchors=3)
+        # segmentation head
+        segmentation_head = UNetSegmentationHead(in_channels=256, out_channels=1)
         
-        # Create dual-task heads
-        segdet_head = SegDetHead(segmentation_head, detection_head)
-        detcls_head = DetClsHead(detection_head, None)  # No ResNet head needed
-        clsseg_head = ClsSegHead(None, segmentation_head)  # No ResNet head needed
+        # detection head
+        yolo_model = YOLO('yolov10s.pt')
+        detection_head = yolo_model.model.model[-1]
         
-        # Create the full model
+        # classification head
+        resnet_head = resnet50(weights=ResNet50_Weights.DEFAULT)
+        num_ftrs = resnet_head.fc.in_features
+        resnet_head.fc = torch.nn.Linear(num_ftrs, 1)  # For binary classification
+        classification_head = resnet_head
+        
+        # classification feature adapter
+        class ClassificationFeatureAdapter(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv = nn.Conv2d(256, 3, 1)  # 1x1 conv to get 3 channels
+                self.mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+                self.std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+            def forward(self, x):
+                x = self.conv(x)
+                x = torch.sigmoid(x)
+                x = nn.functional.interpolate(x, size=(224, 224), mode='bilinear', align_corners=False)
+                device = x.device
+                mean = self.mean.to(device)
+                std = self.std.to(device)
+                x = (x - mean) / std
+                return x
+        
+        classification_feature_adapter = ClassificationFeatureAdapter()
+        
+        # full model
         model = MultiTaskModel(
             encoder=encoder,
             seg_adapter=seg_adapter,
@@ -66,30 +91,22 @@ class ModelEvaluator:
             segdet_expert=segdet_expert,
             detcls_expert=detcls_expert,
             clsseg_expert=clsseg_expert,
-            segdet_head=segdet_head,
-            detcls_head=detcls_head,
-            clsseg_head=clsseg_head
+            big_expert=big_expert,
+            segmentation_head=segmentation_head,
+            detection_head=detection_head,
+            classification_head=classification_head,
+            classification_feature_adapter=classification_feature_adapter
         )
         
-        # Filter out ResNet-related keys that don't exist in current model
+        # Load state dict
         if 'model_state_dict' in checkpoint:
             state_dict = checkpoint['model_state_dict']
         else:
             state_dict = checkpoint
         
-        # Filter out keys that contain 'resnet_head' since we don't use ResNet in current model
-        filtered_state_dict = {}
-        for key, value in state_dict.items():
-            if 'resnet_head' not in key:
-                filtered_state_dict[key] = value
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
         
-        # Load filtered state dict with strict=False to handle any remaining mismatches
-        missing_keys, unexpected_keys = model.load_state_dict(filtered_state_dict, strict=False)
-        
-        # Print information about the loading process
-        print(f"Original state dict had {len(state_dict)} keys")
-        print(f"Filtered state dict has {len(filtered_state_dict)} keys")
-        print(f"Removed {len(state_dict) - len(filtered_state_dict)} ResNet-related keys")
+        print(f"State dict had {len(state_dict)} keys")
         
         if missing_keys:
             print(f"Missing keys (will use default initialization): {len(missing_keys)} keys")
@@ -104,12 +121,12 @@ class ModelEvaluator:
         """Create test data loader"""
         print("Creating test data loader...")
         
-        # Create datasets for each task
+        # datasets for each task
         seg_dataset = SUTCrackDataset(data_root, task='segmentation')
         det_dataset = SUTCrackDataset(data_root, task='detection')
         cls_dataset = SUTCrackDataset(data_root, task='classification')
         
-        # Create multi-task data loader
+        # multi-task data loader
         test_loader = MultiTaskDataLoader(seg_dataset, det_dataset, cls_dataset, batch_size)
         
         print(f"Test loader created with {len(test_loader)} batches")
@@ -125,6 +142,8 @@ class ModelEvaluator:
         iou_scores = []
         dice_scores = []
         pixel_accuracies = []
+        all_pred_probs = []
+        all_target_masks = []
         
         with torch.no_grad():
             for batch in tqdm(test_loader, desc="Segmentation"):
@@ -143,7 +162,7 @@ class ModelEvaluator:
                 
                 # Apply sigmoid and threshold
                 pred_probs = torch.sigmoid(predictions)
-                pred_masks = (pred_probs > 0.5).float()
+                pred_masks = (pred_probs > 0.1).float()  # Optimal threshold from analysis
                 target_masks = (targets > 0).float()  # Ensure binary targets
                 
                 # Debug: print prediction statistics
@@ -153,9 +172,16 @@ class ModelEvaluator:
                     print(f"Target mask range: [{targets.min():.4f}, {targets.max():.4f}]")
                     print(f"Pred mask unique values: {torch.unique(pred_masks)}")
                     print(f"Target mask unique values: {torch.unique(target_masks)}")
+                    print(f"Number of pixels > 0.5 threshold: {(pred_probs > 0.5).sum().item()}")
+                    print(f"Number of pixels > 0.3 threshold: {(pred_probs > 0.3).sum().item()}")
+                    print(f"Number of pixels > 0.1 threshold: {(pred_probs > 0.1).sum().item()}")
+                
+                # Store all predictions and targets for threshold analysis
+                all_pred_probs.extend(pred_probs.cpu())
+                all_target_masks.extend(target_masks.cpu())
                 
                 # Calculate metrics for each sample
-                for i, (pred, target, image) in enumerate(zip(pred_masks, target_masks, images)):
+                for i, (pred, target, image, prob) in enumerate(zip(pred_masks, target_masks, images, pred_probs)):
                     iou = self.calculate_iou(pred, target)
                     dice = self.calculate_dice(pred, target)
                     pixel_acc = self.calculate_pixel_accuracy(pred, target)
@@ -167,10 +193,16 @@ class ModelEvaluator:
                     # Save visualization for first few samples
                     if save_visualizations and len(iou_scores) <= 10:  # Save first 10 samples
                         vis_path = os.path.join(vis_dir, 'segmentation', f'seg_sample_{len(iou_scores):03d}.png')
-                        self.visualize_segmentation(image, target, pred, vis_path)
+                        self.visualize_segmentation(image, target, pred, prob, vis_path)
         
         if not iou_scores:
             return {'error': 'No segmentation samples found'}
+        
+        # Test different thresholds
+        if all_pred_probs:
+            threshold_analysis = self.analyze_thresholds(torch.stack(all_pred_probs), torch.stack(all_target_masks))
+        else:
+            threshold_analysis = {}
         
         return {
             'iou_mean': np.mean(iou_scores),
@@ -179,7 +211,8 @@ class ModelEvaluator:
             'dice_std': np.std(dice_scores),
             'pixel_accuracy_mean': np.mean(pixel_accuracies),
             'pixel_accuracy_std': np.std(pixel_accuracies),
-            'num_samples': len(iou_scores)
+            'num_samples': len(iou_scores),
+            'threshold_analysis': threshold_analysis
         }
     
     def evaluate_classification(self, test_loader, save_visualizations=True, vis_dir='visualizations'):
@@ -212,17 +245,8 @@ class ModelEvaluator:
                 
                 # Apply sigmoid and threshold
                 pred_probs = torch.sigmoid(predictions)
-                pred_classes = (pred_probs > 0.5).float().cpu().numpy().flatten()
+                pred_classes = (pred_probs > 0.1).float().cpu().numpy().flatten()  # Optimal threshold
                 target_classes = targets.cpu().numpy().flatten()
-                
-                # Debug: print classification statistics
-                if len(all_predictions) == 0:  # Only for first batch
-                    print(f"Classification prediction range: [{predictions.min():.4f}, {predictions.max():.4f}]")
-                    print(f"Classification probability range: [{pred_probs.min():.4f}, {pred_probs.max():.4f}]")
-                    print(f"Target classes: {np.unique(target_classes)}")
-                    print(f"Pred classes: {np.unique(pred_classes)}")
-                    print(f"Target class distribution: {np.bincount(target_classes.astype(int))}")
-                    print(f"Pred class distribution: {np.bincount(pred_classes.astype(int))}")
                 
                 all_predictions.extend(pred_classes)
                 all_targets.extend(target_classes)
@@ -281,8 +305,7 @@ class ModelEvaluator:
                 outputs = self.model(images, task_id='detection')
                 predictions = outputs['detection']
                 
-                # Debug: print prediction shape for first few batches
-                if len(all_predictions) == 0:  # Only print for first batch
+                if len(all_predictions) == 0:  
                     print(f"Detection output shape: {predictions.shape}")
                     print(f"Detection output type: {type(predictions)}")
                     if hasattr(predictions, 'dtype'):
@@ -293,11 +316,9 @@ class ModelEvaluator:
                 # Process YOLO outputs
                 for i, (pred, bboxes) in enumerate(zip(predictions, bboxes_list)):
                     if len(bboxes) > 0:
-                        # Convert detection predictions to bounding boxes
                         pred_boxes = self.process_detection_predictions(pred)
                         
-                        # Save visualization for first few samples
-                        if save_visualizations and len(all_predictions) <= 10:  # Save first 10 samples
+                        if save_visualizations and len(all_predictions) <= 10: 
                             vis_path = os.path.join(vis_dir, 'detection', f'det_sample_{len(all_predictions)+1:03d}.png')
                             self.visualize_detection(images[i], bboxes, pred_boxes, vis_path)
                         
@@ -308,26 +329,22 @@ class ModelEvaluator:
                                 iou = self.calculate_bbox_iou(pred_box, gt_box)
                                 max_iou = max(max_iou, iou)
                             
-                            # Consider as positive if IoU > 0.5
                             all_predictions.append(1 if max_iou > 0.5 else 0)
-                            all_targets.append(1)  # Ground truth has boxes
+                            all_targets.append(1)  
                         
-                        # Add false negatives (missed detections)
                         for _ in range(len(bboxes) - len(pred_boxes)):
                             all_predictions.append(0)
                             all_targets.append(1)
                     
                     else:
-                        # No ground truth boxes
                         pred_boxes = self.process_detection_predictions(predictions[i])
                         
-                        # Save visualization for first few samples
                         if save_visualizations and len(all_predictions) <= 10:  # Save first 10 samples
                             vis_path = os.path.join(vis_dir, 'detection', f'det_sample_{len(all_predictions)+1:03d}.png')
                             self.visualize_detection(images[i], [], pred_boxes, vis_path)
                         
                         for _ in pred_boxes:
-                            all_predictions.append(1)  # False positive
+                            all_predictions.append(1)
                             all_targets.append(0)
         
         if not all_predictions:
@@ -345,75 +362,6 @@ class ModelEvaluator:
             'num_samples': len(all_predictions)
         }
     
-    def process_detection_predictions(self, detection_output):
-        """Process detection head output to extract bounding boxes"""
-        # detection_output: (B, H*W*num_anchors, 4+1+num_classes)
-        # Format: [x, y, w, h, confidence, class_score]
-        
-        boxes = []
-        if detection_output is not None and detection_output.numel() > 0:
-            try:
-                # Convert to numpy
-                det_np = detection_output.cpu().numpy()
-                
-                # Handle different output shapes
-                if len(det_np.shape) == 3:
-                    # (B, H*W*num_anchors, 6)
-                    for batch_idx in range(det_np.shape[0]):
-                        batch_detections = det_np[batch_idx]  # (H*W*num_anchors, 6)
-                        
-                        for detection in batch_detections:
-                            if len(detection) >= 6:
-                                # Extract components
-                                x, y, w, h, confidence, class_score = detection[:6]
-                                
-                                # Apply confidence threshold (lowered for debugging)
-                                if confidence > 0.1:  # Lower threshold to see more detections
-                                    # Convert to x1, y1, x2, y2 format
-                                    x1 = x - w/2
-                                    y1 = y - h/2
-                                    x2 = x + w/2
-                                    y2 = y + h/2
-                                    
-                                    # Ensure coordinates are within image bounds
-                                    x1 = max(0, min(1024, x1))
-                                    y1 = max(0, min(1024, y1))
-                                    x2 = max(0, min(1024, x2))
-                                    y2 = max(0, min(1024, y2))
-                                    
-                                    if x2 > x1 and y2 > y1:  # Valid box
-                                        boxes.append([x1, y1, x2, y2])
-                elif len(det_np.shape) == 2:
-                    # (H*W*num_anchors, 6) - single batch
-                    for detection in det_np:
-                        if len(detection) >= 6:
-                            # Extract components
-                            x, y, w, h, confidence, class_score = detection[:6]
-                            
-                            # Apply confidence threshold
-                            if confidence > 0.5:
-                                # Convert to x1, y1, x2, y2 format
-                                x1 = x - w/2
-                                y1 = y - h/2
-                                x2 = x + w/2
-                                y2 = y + h/2
-                                
-                                # Ensure coordinates are within image bounds
-                                x1 = max(0, min(1024, x1))
-                                y1 = max(0, min(1024, y1))
-                                x2 = max(0, min(1024, x2))
-                                y2 = max(0, min(1024, y2))
-                                
-                                if x2 > x1 and y2 > y1:  # Valid box
-                                    boxes.append([x1, y1, x2, y2])
-                else:
-                    print(f"Unexpected detection output shape: {det_np.shape}")
-                    
-            except Exception as e:
-                print(f"Error processing detection output: {e}")
-                print(f"Detection output shape: {detection_output.shape if hasattr(detection_output, 'shape') else 'unknown'}")
-        
-        return boxes
     
     def calculate_bbox_iou(self, box1, box2):
         """Calculate IoU between two bounding boxes"""
@@ -456,6 +404,60 @@ class ModelEvaluator:
         total = pred.numel()
         return (correct / total).item()
     
+    def analyze_thresholds(self, pred_probs, target_masks):
+        """Analyze performance at different threshold values"""
+        thresholds = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+        results = {}
+        
+        print("\nThreshold Analysis:")
+        print("Threshold | IoU    | Dice   | Pixel Acc | Pixels > Thresh")
+        print("-" * 55)
+        
+        best_dice = 0
+        best_threshold = 0.5
+        
+        for thresh in thresholds:
+            pred_masks = (pred_probs > thresh).float()
+            
+            # Calculate metrics
+            ious = []
+            dices = []
+            pixel_accs = []
+            
+            for pred, target in zip(pred_masks, target_masks):
+                iou = self.calculate_iou(pred, target)
+                dice = self.calculate_dice(pred, target)
+                pixel_acc = self.calculate_pixel_accuracy(pred, target)
+                
+                ious.append(iou)
+                dices.append(dice)
+                pixel_accs.append(pixel_acc)
+            
+            mean_iou = np.mean(ious)
+            mean_dice = np.mean(dices)
+            mean_pixel_acc = np.mean(pixel_accs)
+            pixels_above_thresh = (pred_probs > thresh).sum().item()
+            
+            results[thresh] = {
+                'iou': mean_iou,
+                'dice': mean_dice,
+                'pixel_accuracy': mean_pixel_acc,
+                'pixels_above_threshold': pixels_above_thresh
+            }
+            
+            # Track best threshold based on Dice score
+            if mean_dice > best_dice:
+                best_dice = mean_dice
+                best_threshold = thresh
+            
+            print(f"{thresh:8.1f} | {mean_iou:6.3f} | {mean_dice:6.3f} | {mean_pixel_acc:9.3f} | {pixels_above_thresh:13d}")
+        
+        print(f"\nBest threshold based on Dice score: {best_threshold:.1f} (Dice: {best_dice:.3f})")
+        results['best_threshold'] = best_threshold
+        results['best_dice'] = best_dice
+        
+        return results
+    
     def plot_confusion_matrix(self, y_true, y_pred, task_name, save_path):
         """Plot and save confusion matrix"""
         cm = confusion_matrix(y_true, y_pred)
@@ -473,8 +475,8 @@ class ModelEvaluator:
         with open(save_path, 'w') as f:
             json.dump(results, f, indent=4)
     
-    def visualize_segmentation(self, image, target_mask, pred_mask, save_path):
-        """Create and save segmentation visualization"""
+    def visualize_segmentation(self, image, target_mask, pred_mask, pred_probs, save_path):
+        """Create and save segmentation visualization with gradient image"""
         # Convert tensors to numpy
         if isinstance(image, torch.Tensor):
             image = image.cpu().numpy()
@@ -482,12 +484,16 @@ class ModelEvaluator:
             target_mask = target_mask.cpu().numpy()
         if isinstance(pred_mask, torch.Tensor):
             pred_mask = pred_mask.cpu().numpy()
+        if isinstance(pred_probs, torch.Tensor):
+            pred_probs = pred_probs.cpu().numpy()
         
         # Squeeze channel dimension if present (should be H, W)
         if target_mask.ndim == 3 and target_mask.shape[0] == 1:
             target_mask = target_mask[0]
         if pred_mask.ndim == 3 and pred_mask.shape[0] == 1:
             pred_mask = pred_mask[0]
+        if pred_probs.ndim == 3 and pred_probs.shape[0] == 1:
+            pred_probs = pred_probs[0]
         
         # Normalize image to 0-1 range and transpose to (H, W, C)
         if image.max() > 1:
@@ -495,8 +501,25 @@ class ModelEvaluator:
         if image.shape[0] == 3:
             image = image.transpose(1, 2, 0)
         
-        # Create figure with subplots
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        # Compute an adaptive threshold (Otsu) from probabilities for visualization
+        def _otsu_threshold(probs_np):
+            hist, bin_edges = np.histogram(probs_np.flatten(), bins=256, range=(0.0, 1.0))
+            hist = hist.astype(np.float64)
+            total = probs_np.size
+            bin_mids = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+            weight1 = np.cumsum(hist)
+            weight2 = total - weight1
+            valid = (weight1 > 0) & (weight2 > 0)
+            mean1 = np.cumsum(hist * bin_mids) / np.maximum(weight1, 1e-12)
+            mean2 = (np.cumsum((hist * bin_mids)[::-1]) / np.maximum(weight2[::-1], 1e-12))[::-1]
+            between_var = weight1 * weight2 * (mean1 - mean2) ** 2
+            idx = np.argmax(np.where(valid, between_var, -1))
+            return float(bin_mids[idx])
+
+        otsu_thr = _otsu_threshold(pred_probs if isinstance(pred_probs, np.ndarray) else pred_probs)
+        otsu_mask = (pred_probs > otsu_thr).astype(np.float32)
+
+        fig, axes = plt.subplots(1, 4, figsize=(20, 5))
         
         # Original image
         axes[0].imshow(image)
@@ -508,10 +531,16 @@ class ModelEvaluator:
         axes[1].set_title('Ground Truth Mask')
         axes[1].axis('off')
         
-        # Predicted mask
-        axes[2].imshow(pred_mask, cmap='gray')
-        axes[2].set_title('Predicted Mask')
+        # Predicted probability map (gradient image)
+        im = axes[2].imshow(pred_probs, cmap='hot', vmin=0, vmax=1)
+        axes[2].set_title(f'Predicted Probabilities\nMin: {pred_probs.min():.3f}, Max: {pred_probs.max():.3f}')
         axes[2].axis('off')
+        plt.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04)
+        
+        # Predicted mask (adaptive Otsu threshold)
+        axes[3].imshow(otsu_mask, cmap='gray')
+        axes[3].set_title(f'Predicted Mask (Otsu thr={otsu_thr:.3f})')
+        axes[3].axis('off')
         
         plt.tight_layout()
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -519,33 +548,26 @@ class ModelEvaluator:
     
     def visualize_detection(self, image, gt_boxes, pred_boxes, save_path):
         """Create and save detection visualization"""
-        # Convert tensors to numpy
         if isinstance(image, torch.Tensor):
             image = image.cpu().numpy()
         
-        # Normalize image to 0-1 range
         if image.max() > 1:
             image = image / 255.0
         
-        # Create figure
         fig, axes = plt.subplots(1, 2, figsize=(15, 7))
         
-        # Original image
         axes[0].imshow(image.transpose(1, 2, 0))
         axes[0].set_title('Original Image')
         axes[0].axis('off')
         
-        # Image with detections
         axes[1].imshow(image.transpose(1, 2, 0))
         
-        # Draw ground truth boxes in green
         for box in gt_boxes:
             x1, y1, x2, y2 = box
             rect = patches.Rectangle((x1, y1), x2-x1, y2-y1, 
                                    fill=False, color='green', linewidth=2, label='Ground Truth')
             axes[1].add_patch(rect)
         
-        # Draw predicted boxes in red
         for box in pred_boxes:
             x1, y1, x2, y2 = box
             rect = patches.Rectangle((x1, y1), x2-x1, y2-y1, 
@@ -555,7 +577,6 @@ class ModelEvaluator:
         axes[1].set_title('Detection Results (Green: GT, Red: Pred)')
         axes[1].axis('off')
         
-        # Add legend
         from matplotlib.patches import Patch
         legend_elements = [Patch(facecolor='green', label='Ground Truth'),
                           Patch(facecolor='red', label='Prediction')]
@@ -567,26 +588,20 @@ class ModelEvaluator:
     
     def visualize_classification(self, image, true_label, pred_label, pred_prob, save_path):
         """Create and save classification visualization"""
-        # Convert tensors to numpy
         if isinstance(image, torch.Tensor):
             image = image.cpu().numpy()
         
-        # Normalize image to 0-1 range
         if image.max() > 1:
             image = image / 255.0
         
-        # Create figure
         fig, ax = plt.subplots(1, 1, figsize=(8, 8))
         
-        # Show image
         ax.imshow(image.transpose(1, 2, 0))
         
-        # Add text with classification results
         result_text = f'True Label: {"Crack" if true_label == 1 else "No Crack"}\n'
         result_text += f'Predicted: {"Crack" if pred_label == 1 else "No Crack"}\n'
         result_text += f'Confidence: {pred_prob:.3f}'
         
-        # Color code the text
         color = 'green' if true_label == pred_label else 'red'
         
         ax.text(0.05, 0.95, result_text, transform=ax.transAxes, 
@@ -605,13 +620,11 @@ class ModelEvaluator:
         """Run full evaluation pipeline"""
         print("Starting model evaluation...")
         
-        # Create save directory
         os.makedirs(save_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
         results = {}
         
-        # Evaluate each task
         try:
             seg_results = self.evaluate_segmentation(test_loader, save_visualizations=True, vis_dir=save_dir)
             results['segmentation'] = seg_results
@@ -636,7 +649,6 @@ class ModelEvaluator:
             print(f"Error in detection evaluation: {e}")
             results['detection'] = {'error': str(e)}
         
-        # Save results
         results_path = os.path.join(save_dir, f'evaluation_results_{timestamp}.json')
         self.save_evaluation_results(results, results_path)
         
@@ -648,7 +660,7 @@ class ModelEvaluator:
 def main():
     """Main evaluation function"""
     # Configuration
-    model_path = "models/multitask_crack_model_20250715_233538.pth"  # Update with your model path
+    model_path = "models/multitask_crack_model_20251007_194523.pth"  # Update with your model
     data_root = "SUT-Crack"  # Update with your data path
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     batch_size = 6  # Adjust based on your GPU memory
@@ -672,10 +684,10 @@ def main():
     # Create test data loader
     test_loader = evaluator.create_test_loader(data_root, batch_size)
     
-    # Run evaluation
+    # Evaluation
     results = evaluator.run_evaluation(test_loader)
     
-    # Print summary
+    # Summary
     print("\n" + "="*50)
     print("EVALUATION SUMMARY")
     print("="*50)

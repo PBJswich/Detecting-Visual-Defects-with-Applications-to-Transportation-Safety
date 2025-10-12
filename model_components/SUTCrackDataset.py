@@ -2,7 +2,7 @@ import os
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
-from PIL import Image
+from PIL import Image, ImageOps
 import xml.etree.ElementTree as ET
 import numpy as np
 
@@ -94,6 +94,7 @@ class SUTCrackDataset(Dataset):
     def __getitem__(self, idx):
         sample = self.samples[idx]
         img = Image.open(sample['img']).convert('RGB')
+        img = ImageOps.exif_transpose(img)
         img = self._center_crop(img)
         mask = None
         bboxes = None
@@ -102,7 +103,9 @@ class SUTCrackDataset(Dataset):
             if self.task == 'segmentation':
                 mask = Image.open(sample['mask']).convert('L')
                 mask = self._center_crop(mask)
-                mask = torch.from_numpy(np.array(mask)).long()
+                mask_np = np.array(mask)
+                mask_bin = (mask_np > 0).astype(np.uint8)
+                mask = torch.from_numpy(mask_bin)
                 label = 1
             elif self.task == 'detection':
                 bboxes = self._parse_xml(sample['bbox'])

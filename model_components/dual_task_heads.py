@@ -23,6 +23,8 @@ class UNetSegmentationHead(nn.Module):
         self.upconv1 = nn.Sequential(
             nn.Conv2d(features[0], out_channels, 1)
         )
+        
+        self._initialize_weights()
 
     def contract_block(self, in_channels, out_channels):
         block = nn.Sequential(
@@ -61,6 +63,18 @@ class UNetSegmentationHead(nn.Module):
         dec2 = dec2 + enc1
         out = self.upconv1(dec2)
         return out
+    
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+        
+        final_conv = self.upconv1[0]
+        nn.init.normal_(final_conv.weight, mean=0.1, std=0.01)
+        if final_conv.bias is not None:
+            nn.init.constant_(final_conv.bias, 0.1)
 
 class YOLOFeatureAdapter(nn.Module):
     """
