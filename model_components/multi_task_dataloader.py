@@ -1,5 +1,5 @@
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 import random
 
 class MultiTaskBatchSampler:
@@ -29,10 +29,14 @@ class MultiTaskBatchSampler:
         return self.num_batches
 
 class MultiTaskDataLoader:
-    def __init__(self, seg_dataset, det_dataset, cls_dataset, batch_size):
+    def __init__(self, seg_dataset, det_dataset, cls_dataset, batch_size, 
+                 num_workers=4, pin_memory=True, prefetch_factor=2):
         self.datasets = [seg_dataset, det_dataset, cls_dataset]
         self.sampler = MultiTaskBatchSampler(self.datasets, batch_size)
         self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.pin_memory = pin_memory
+        self.prefetch_factor = prefetch_factor
 
     def __iter__(self):
         for batch_indices in self.sampler:

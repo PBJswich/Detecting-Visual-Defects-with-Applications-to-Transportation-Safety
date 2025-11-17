@@ -24,13 +24,15 @@ class SUTCrackDataset(Dataset):
     def _load_positives(self):
         img_dir = os.path.join(self.root_dir, '1-Segmentation', 'Original Image')
         mask_dir = os.path.join(self.root_dir, '1-Segmentation', 'Ground Truth')
-        bbox_dir = os.path.join(self.root_dir, '2-Object Detection')
+        # Use YOLO annotations instead of XML
+        bbox_dir = os.path.join(self.root_dir, 'yolo_annotations')
         images = sorted([f for f in os.listdir(img_dir) if f.endswith('.jpg')])
         positives = []
         for img_name in images:
             base = os.path.splitext(img_name)[0]
             mask_name = f"{base}.png"
-            bbox_name = f"{base}.xml"
+            # Use .txt for YOLO annotations instead of .xml
+            bbox_name = f"{base}.txt"
             img_path = os.path.join(img_dir, img_name)
             mask_path = os.path.join(mask_dir, mask_name)
             bbox_path = os.path.join(bbox_dir, bbox_name)
@@ -77,6 +79,7 @@ class SUTCrackDataset(Dataset):
         return img.crop((left, top, right, bottom))
 
     def _parse_xml(self, xml_path):
+        """Parse XML format - kept for backward compatibility"""
         bboxes = []
         if not os.path.exists(xml_path):
             return bboxes
@@ -89,6 +92,45 @@ class SUTCrackDataset(Dataset):
             xmax = int(float(bbox.find('xmax').text))
             ymax = int(float(bbox.find('ymax').text))
             bboxes.append([xmin, ymin, xmax, ymax])
+        return bboxes
+    
+    def _parse_yolo_txt(self, txt_path, img_width, img_height):
+        """
+        Parse YOLO format annotation file
+        
+        YOLO format: class_id x_center y_center width height (all normalized to [0,1])
+        Returns: list of [xmin, ymin, xmax, ymax] in pixel coordinates
+        """
+        bboxes = []
+        if not os.path.exists(txt_path):
+            return bboxes
+        
+        with open(txt_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if len(parts) >= 5:
+                    class_id = int(parts[0])
+                    x_center = float(parts[1])
+                    y_center = float(parts[2])
+                    width = float(parts[3])
+                    height = float(parts[4])
+                    
+                    # Convert from YOLO format to pixel coordinates
+                    x_center_px = x_center * img_width
+                    y_center_px = y_center * img_height
+                    width_px = width * img_width
+                    height_px = height * img_height
+                    
+                    xmin = int(x_center_px - width_px / 2)
+                    ymin = int(y_center_px - height_px / 2)
+                    xmax = int(x_center_px + width_px / 2)
+                    ymax = int(y_center_px + height_px / 2)
+                    
+                    bboxes.append([xmin, ymin, xmax, ymax])
+        
         return bboxes
 
     def __getitem__(self, idx):
@@ -108,7 +150,14 @@ class SUTCrackDataset(Dataset):
                 mask = torch.from_numpy(mask_bin)
                 label = 1
             elif self.task == 'detection':
-                bboxes = self._parse_xml(sample['bbox'])
+                # Try YOLO format first, fall back to XML if needed
+                if sample['bbox'].endswith('.txt'):
+                    # Get image dimensions for coordinate conversion
+                    img_width, img_height = img.size
+                    bboxes = self._parse_yolo_txt(sample['bbox'], img_width, img_height)
+                else:
+                    # Fall back to XML parsing
+                    bboxes = self._parse_xml(sample['bbox'])
                 label = 1
             elif self.task == 'classification':
                 label = 1

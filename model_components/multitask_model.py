@@ -79,12 +79,6 @@ class MultiTaskModel(nn.Module):
                 return {'detection': det_out}
             elif task_id == 'classification':
                 cls_img = self.classification_feature_adapter(fused_spatial)
-                # Debugging: print shape, dtype, min, max, NaN/Inf check
-                print('cls_img shape:', cls_img.shape, 'dtype:', cls_img.dtype)
-                print('cls_img min:', cls_img.min().item(), 'max:', cls_img.max().item(), 'mean:', cls_img.mean().item())
-                if torch.isnan(cls_img).any() or torch.isinf(cls_img).any():
-                    print('NaN or Inf detected in classification input!')
-                    raise ValueError('NaN or Inf detected in classification input!')
                 cls_img = cls_img.to(self.classification_head.fc.weight.device)
                 cls_out = self.classification_head(cls_img)
                 return {'classification': cls_out}
