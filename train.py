@@ -1,5 +1,7 @@
 import torch
-torch.backends.cudnn.enabled = False
+# Fix cuDNN issues with batch normalization
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
 from torch.optim import Adam
 from model_components.multitask_model import MultiTaskModel
 from model_components.multitask_loss import MultiTaskLoss
@@ -50,6 +52,8 @@ from torchvision.models import resnet50, ResNet50_Weights
 resnet_head = resnet50(weights=ResNet50_Weights.DEFAULT)
 num_ftrs = resnet_head.fc.in_features
 resnet_head.fc = torch.nn.Linear(num_ftrs, 1)  # For binary classification
+# Set to eval mode to use running stats in batch norm (fixes cuDNN issues)
+resnet_head.eval()
 classification_head = resnet_head
 
 # Add a feature adapter for classification to convert (B, 256, 64, 64) -> (B, 3, 224, 224)
@@ -97,7 +101,7 @@ cls_ds = SUTCrackDataset(root_dir, task='classification')
 # Instantiate the multitask DataLoader
 loader = MultiTaskDataLoader(seg_ds, det_ds, cls_ds, batch_size=3)
 
-num_epochs = 10
+num_epochs = 200
 
 # Clear GPU memory at start of training
 torch.cuda.empty_cache()
@@ -217,7 +221,3 @@ torch.save({
 
 print(f"Model saved to: {model_path}")
 
-# Also save just the model for easier loading
-model_only_path = f'models/multitask_crack_model_{timestamp}_model_only.pth'
-torch.save(model.state_dict(), model_only_path)
-print(f"Model state dict saved to: {model_only_path}")

@@ -1,7 +1,9 @@
-torch
+# PyTorch with CUDA support - install with:
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+torch>=2.5.0
+torchvision>=0.20.0
 segment-anything
 transformers
-torchvision
 numpy
 scipy
 Pillow 

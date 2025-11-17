@@ -1,4 +1,7 @@
 import torch
+# Fix cuDNN issues with batch normalization
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
 import torch.nn as nn
 import numpy as np
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix
@@ -16,12 +19,14 @@ import cv2
 # Import your model components
 from model_components.sam_encoder import SAMEncoder
 from model_components.adapters import SegmentationAdapter, DetectionAdapter, ClassificationAdapter
-from model_components.expert_modules import SegDetExpert, DetClsExpert, ClsSegExpert
-from model_components.dual_task_heads import SegDetHead, DetClsHead, ClsSegHead, SimpleSegmentationHead, SimpleDetectionHead
+from model_components.expert_modules import SegDetExpert, DetClsExpert, ClsSegExpert, BigExpert
+from model_components.dual_task_heads import UNetSegmentationHead
 from model_components.multitask_model import MultiTaskModel
 from model_components.multitask_loss import MultiTaskLoss
 from model_components.SUTCrackDataset import SUTCrackDataset
 from model_components.multi_task_dataloader import MultiTaskDataLoader
+from ultralytics import YOLO
+from torchvision.models import resnet50, ResNet50_Weights
 
 class ModelEvaluator:
     def __init__(self, model_path, device='cuda'):
@@ -36,65 +41,85 @@ class ModelEvaluator:
         # Load checkpoint
         checkpoint = torch.load(model_path, map_location=self.device)
         
-        # Reconstruct model components
+        # Reconstruct model components exactly as in train.py
         encoder = SAMEncoder(checkpoint_path="sam_vit_b_01ec64.pth")
+        
+        # Adapters
         seg_adapter = SegmentationAdapter(input_dim=256, output_dim=256)
         det_adapter = DetectionAdapter(input_dim=256, output_dim=256)
         cls_adapter = ClassificationAdapter(input_dim=256, output_dim=256)
         
+        # Expert modules
         segdet_expert = SegDetExpert(input_dim1=256, input_dim2=256, output_dim=256)
         detcls_expert = DetClsExpert(input_dim1=256, input_dim2=256, output_dim=256)
         clsseg_expert = ClsSegExpert(input_dim1=256, input_dim2=256, output_dim=256)
+        big_expert = BigExpert(input_dim1=256, input_dim2=256, input_dim3=256, output_dim=256)
         
-        # Create segmentation head
-        segmentation_head = SimpleSegmentationHead(in_channels=256, out_channels=1)
+        # Heads
+        segmentation_head = UNetSegmentationHead(in_channels=256, out_channels=1)
         
-        # Create detection head
-        detection_head = SimpleDetectionHead(in_channels=256, num_classes=1, num_anchors=3)
+        # Detection head: use YOLO head
+        yolo_model = YOLO('yolov10s.pt')
+        detection_head = yolo_model.model.model[-1]
         
-        # Create dual-task heads
-        segdet_head = SegDetHead(segmentation_head, detection_head)
-        detcls_head = DetClsHead(detection_head, None)  # No ResNet head needed
-        clsseg_head = ClsSegHead(None, segmentation_head)  # No ResNet head needed
+        # Classification head: use ResNet-50
+        resnet_head = resnet50(weights=ResNet50_Weights.DEFAULT)
+        num_ftrs = resnet_head.fc.in_features
+        resnet_head.fc = torch.nn.Linear(num_ftrs, 1)
+        resnet_head.eval()  # Set to eval mode
+        classification_head = resnet_head
+        
+        # Classification feature adapter
+        class ClassificationFeatureAdapter(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv = nn.Conv2d(256, 3, 1)
+                self.mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+                self.std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+            
+            def forward(self, x):
+                x = self.conv(x)
+                x = torch.sigmoid(x)
+                x = nn.functional.interpolate(x, size=(224, 224), mode='bilinear', align_corners=False)
+                device = x.device
+                mean = self.mean.to(device)
+                std = self.std.to(device)
+                x = (x - mean) / std
+                return x
+        
+        classification_feature_adapter = ClassificationFeatureAdapter()
         
         # Create the full model
         model = MultiTaskModel(
-            encoder=encoder,
-            seg_adapter=seg_adapter,
-            det_adapter=det_adapter,
-            cls_adapter=cls_adapter,
-            segdet_expert=segdet_expert,
-            detcls_expert=detcls_expert,
-            clsseg_expert=clsseg_expert,
-            segdet_head=segdet_head,
-            detcls_head=detcls_head,
-            clsseg_head=clsseg_head
+            encoder, seg_adapter, det_adapter, cls_adapter,
+            segdet_expert, detcls_expert, clsseg_expert,
+            big_expert,
+            segmentation_head, detection_head, classification_head,
+            classification_feature_adapter
         )
         
-        # Filter out ResNet-related keys that don't exist in current model
+        # Load state dict
         if 'model_state_dict' in checkpoint:
             state_dict = checkpoint['model_state_dict']
         else:
             state_dict = checkpoint
         
-        # Filter out keys that contain 'resnet_head' since we don't use ResNet in current model
-        filtered_state_dict = {}
-        for key, value in state_dict.items():
-            if 'resnet_head' not in key:
-                filtered_state_dict[key] = value
-        
-        # Load filtered state dict with strict=False to handle any remaining mismatches
-        missing_keys, unexpected_keys = model.load_state_dict(filtered_state_dict, strict=False)
+        # Load state dict with strict=False to handle any mismatches
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
         
         # Print information about the loading process
-        print(f"Original state dict had {len(state_dict)} keys")
-        print(f"Filtered state dict has {len(filtered_state_dict)} keys")
-        print(f"Removed {len(state_dict) - len(filtered_state_dict)} ResNet-related keys")
+        print(f"Loaded state dict with {len(state_dict)} keys")
         
         if missing_keys:
             print(f"Missing keys (will use default initialization): {len(missing_keys)} keys")
+            if len(missing_keys) <= 10:
+                for key in missing_keys:
+                    print(f"  - {key}")
         if unexpected_keys:
             print(f"Unexpected keys (will be ignored): {len(unexpected_keys)} keys")
+            if len(unexpected_keys) <= 10:
+                for key in unexpected_keys:
+                    print(f"  - {key}")
         
         model = model.to(self.device)
         print("Model loaded successfully!")
@@ -155,7 +180,7 @@ class ModelEvaluator:
                     print(f"Target mask unique values: {torch.unique(target_masks)}")
                 
                 # Calculate metrics for each sample
-                for i, (pred, target, image) in enumerate(zip(pred_masks, target_masks, images)):
+                for i, (pred, target, image, prob) in enumerate(zip(pred_masks, target_masks, images, pred_probs)):
                     iou = self.calculate_iou(pred, target)
                     dice = self.calculate_dice(pred, target)
                     pixel_acc = self.calculate_pixel_accuracy(pred, target)
@@ -167,7 +192,7 @@ class ModelEvaluator:
                     # Save visualization for first few samples
                     if save_visualizations and len(iou_scores) <= 10:  # Save first 10 samples
                         vis_path = os.path.join(vis_dir, 'segmentation', f'seg_sample_{len(iou_scores):03d}.png')
-                        self.visualize_segmentation(image, target, pred, vis_path)
+                        self.visualize_segmentation(image, target, pred, vis_path, pred_probs=prob)
         
         if not iou_scores:
             return {'error': 'No segmentation samples found'}
@@ -473,7 +498,7 @@ class ModelEvaluator:
         with open(save_path, 'w') as f:
             json.dump(results, f, indent=4)
     
-    def visualize_segmentation(self, image, target_mask, pred_mask, save_path):
+    def visualize_segmentation(self, image, target_mask, pred_mask, save_path, pred_probs=None):
         """Create and save segmentation visualization"""
         # Convert tensors to numpy
         if isinstance(image, torch.Tensor):
@@ -482,12 +507,16 @@ class ModelEvaluator:
             target_mask = target_mask.cpu().numpy()
         if isinstance(pred_mask, torch.Tensor):
             pred_mask = pred_mask.cpu().numpy()
+        if pred_probs is not None and isinstance(pred_probs, torch.Tensor):
+            pred_probs = pred_probs.cpu().numpy()
         
         # Squeeze channel dimension if present (should be H, W)
         if target_mask.ndim == 3 and target_mask.shape[0] == 1:
             target_mask = target_mask[0]
         if pred_mask.ndim == 3 and pred_mask.shape[0] == 1:
             pred_mask = pred_mask[0]
+        if pred_probs is not None and pred_probs.ndim == 3 and pred_probs.shape[0] == 1:
+            pred_probs = pred_probs[0]
         
         # Normalize image to 0-1 range and transpose to (H, W, C)
         if image.max() > 1:
@@ -495,8 +524,9 @@ class ModelEvaluator:
         if image.shape[0] == 3:
             image = image.transpose(1, 2, 0)
         
-        # Create figure with subplots
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        # Create figure with subplots (4 if we have probabilities, 3 otherwise)
+        num_plots = 4 if pred_probs is not None else 3
+        fig, axes = plt.subplots(1, num_plots, figsize=(5*num_plots, 5))
         
         # Original image
         axes[0].imshow(image)
@@ -508,10 +538,19 @@ class ModelEvaluator:
         axes[1].set_title('Ground Truth Mask')
         axes[1].axis('off')
         
-        # Predicted mask
+        # Predicted mask (thresholded)
         axes[2].imshow(pred_mask, cmap='gray')
-        axes[2].set_title('Predicted Mask')
+        axes[2].set_title('Predicted Mask (Threshold=0.5)')
         axes[2].axis('off')
+        
+        # Raw probabilities (no threshold)
+        if pred_probs is not None:
+            im = axes[3].imshow(pred_probs, cmap='gray', vmin=0, vmax=1)
+            axes[3].set_title('Raw Probabilities (No Threshold)')
+            axes[3].axis('off')
+            # Add colorbar
+            cbar = plt.colorbar(im, ax=axes[3], fraction=0.046, pad=0.04)
+            cbar.set_label('Probability', rotation=270, labelpad=15)
         
         plt.tight_layout()
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -648,10 +687,10 @@ class ModelEvaluator:
 def main():
     """Main evaluation function"""
     # Configuration
-    model_path = "models/multitask_crack_model_20250715_233538.pth"  # Update with your model path
-    data_root = "SUT-Crack"  # Update with your data path
+    model_path = "models/multitask_crack_model_20251106_081420.pth"  # Latest model
+    data_root = "SUT-Crack"  # Data directory
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    batch_size = 6  # Adjust based on your GPU memory
+    batch_size = 3  # Match training batch size
     
     print(f"Using device: {device}")
     print(f"Model path: {model_path}")
